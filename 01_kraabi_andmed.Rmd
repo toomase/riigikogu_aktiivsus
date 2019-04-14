@@ -1,0 +1,581 @@
+---
+title: "Kraabi info Riigikogu liikmete aktiivsuse kohta"
+---
+
+
+```{r}
+library(tidyverse)
+library(rvest)
+library(janitor)
+library(lubridate)
+library(runner)
+library(tictoc)
+library(furrr)
+library(seleniumPipes)
+
+# selleks, et kasutada mitme tuumaga paralleelselt arvutamist
+future::plan(multiprocess)
+
+riigikogu_liikmed_url <- "https://www.riigikogu.ee/riigikogu/koosseis/riigikogu-liikmed/"
+
+```
+
+Lae Riigikogu liikmete nimed ja isikliku lehe lingid
+```{r}
+riigikogu_liikmed_html <- read_html(riigikogu_liikmed_url) 
+
+nimi <- riigikogu_liikmed_html %>% 
+  html_nodes("h3 a") %>% 
+  html_text() %>% 
+  str_squish()
+
+fraktsioon <- riigikogu_liikmed_html %>% 
+  html_nodes("strong") %>% 
+  html_text() %>% 
+  str_squish() %>% 
+  head(101)
+
+link <- riigikogu_liikmed_html %>% 
+  html_nodes("h3 a") %>% 
+  html_attr("href") %>% 
+  str_replace_all(., "(\\/)(?!.*\\/).*", "") %>%  # eemalda nimi lingi lõpust
+  str_c(., "#contactcard")
+
+riigikogu_liimed_raw <- tibble(nimi, fraktsioon, link)
+```
+
+Funktsioon, et kraapida iga riigikogu liikme kohta detailandmete lehtede lingid
+```{r}
+kraabi_detailinfo_lingid <- function(x, y){
+  html_raw <- read_html(x)
+  
+  lingi_nimi <- html_raw %>%
+    html_nodes(".read-more a") %>% 
+    html_text()
+  
+  link <- html_raw %>%
+    html_nodes(".read-more a") %>% 
+    html_attr("href")    
+  
+  kokku <- tibble(lingi_nimi, link) %>% 
+    mutate(riigikogu_liige = y)
+}
+
+kraabi_detailinfo_lingid_possibly <- possibly(kraabi_detailinfo_lingid, NULL)
+```
+
+Kraabi detailandmete lehtede lingid
+```{r}
+detailinfo_lingid <- map2_df(riigikogu_liimed_raw$link, riigikogu_liimed_raw$nimi,
+                             kraabi_detailinfo_lingid_possibly)
+```
+
+Kontrolli, kas 101 Riigikogu liikme andmed on olemas
+```{r}
+detailinfo_lingid %>% 
+  summarise(n_distinct(riigikogu_liige))
+```
+
+```{r}
+glimpse(detailinfo_lingid)
+```
+
+Salvesta detailinfo lingid
+```{r}
+detailinfo_lingid %>% write_rds("data/detailinfo_lingid.rds")
+```
+
+
+## Sõnavõtud
+
+Funktsioon, mis kraabib iga riigikogu liikme stenogrammide arvu
+```{r}
+kraabi_stenogrammide_arv <- function(x, y){
+  raw_text <- read_html(x) %>% 
+    html_text()
+  
+  tibble(riigikogu_liige = y, stenogramme = as.numeric(str_extract(raw_text, "(?<=Stenogrammid: )\\d*")))
+}
+```
+
+Kraabi iga Riigikogu liikme kohta tema stenogrammide arv. Selle põhjal saab järgmises sammus kraapida kõik sõnavõtud. 
+```{r}
+sonavotu_url_unikaalne <- sonavotu_url %>% 
+  group_by(riigikogu_liige) %>% 
+  filter(row_number() == 1) %>% 
+  ungroup()
+
+stenogrammide_arv <- map2_df(sonavotu_url_unikaalne$link, sonavotu_url_unikaalne$riigikogu_liige,
+                             kraabi_stenogrammide_arv)
+```
+
+Mitmel leheküljel on riigikogu liikme sõnavaõtud. Ühele lehel on max 25 stenogrammi andmed.
+```{r}
+stenogrammide_arv_toodeldud <- stenogrammide_arv %>% 
+  mutate(lehti = ceiling(stenogramme / 25)) %>% 
+  select(riigikogu_liige, lehti)
+```
+
+
+
+Genereeri sõnavõttude lingid. Iga Riigikogu liime kohte 10 lehekülge.
+```{r}
+sonavotu_url <- detailinfo_lingid %>% 
+  filter(lingi_nimi == "Kõik sõnavõtud") %>% 
+  select(link, riigikogu_liige) %>% 
+  left_join(stenogrammide_arv_toodeldud, by = "riigikogu_liige") %>% 
+  splitstackshape::expandRows("lehti") %>% 
+  group_by(riigikogu_liige) %>% 
+  mutate(sonavotu_url = str_c(link, "?page=", row_number()))
+
+glimpse(sonavotu_url)
+```
+
+Funktsioon, mis kraabib kuupäeva ja kellaaegade seisuga sõnavõttude arvu iga riigikogu liikme kohta
+```{r}
+kraabi_sonavotud <- function(x, y){
+  Sys.sleep(runif(1, min = 0.5, max = 1.5))
+  
+  sonavotte <- read_html(x) %>% 
+    html_nodes(".width-17 , strong") %>% 
+    html_text() %>% 
+    tibble(value = .) %>% 
+    # kuna veerus on kuupäev ja sellel järgnevalt nimi nii mitu korda kui sõna on võetud, siis tuleb
+    # andmed töödelda nii, et iga kuupäeva järel on sõnavõttude arvu nr (ehk mitu korda nimi järgneb kuupäevale)
+    mutate(flag_kp = if_else(str_detect(value, "\\d"), 1, 0)) %>% 
+    group_by(flag_kp) %>% 
+    mutate(jrk = row_number()) %>% 
+    ungroup() %>% 
+    mutate(st = runner::streak_run(flag_kp),
+           st_2 = lag(st)) %>% 
+    filter(flag_kp == 1 | row_number() == max(row_number())) %>% 
+    mutate(sonavotte = lead(st_2)) %>% 
+    filter(flag_kp == 1) %>% 
+    select(value, sonavotte) %>% 
+    mutate(riigikogu_liige = y)
+  
+  return(sonavotte)
+}
+
+kraabi_sonavotud_possibly <- possibly(kraabi_sonavotud, NULL)
+```
+
+Kraabi kuupäevade lõikes iga riigikogu liikme sõnavõttude arvud
+```{r}
+tic()
+sonavotud <- map2_df(sonavotu_url$sonavotu_url, sonavotu_url$riigikogu_liige,
+                             kraabi_sonavotud_possibly)
+toc()
+
+sonavotud %>% write_rds("data/sonavotud.rds")
+```
+
+```{r}
+glimpse(sonavotud)
+```
+
+Töötle sõnavõttude andmeid
+```{r}
+sonavotud_toodeldud <- sonavotud %>% 
+  mutate(kp = as.Date(value, "%d.%m.%Y"))
+
+sonavotud_toodeldud
+```
+
+XIII Riigikogu sõnavõtud
+```{r}
+sonavotud_toodeldud %>% 
+  filter(kp > as.Date("2015-04-01")) %>% 
+  group_by(riigikogu_liige) %>% 
+  summarise(sonavotte = sum(sonavotte)) %>% 
+  arrange(desc(sonavotte))
+```
+
+
+## Arupärimised
+
+
+Genereeri arupärimiste lingid. Iga Riigikogu liime kohte 5 lehekülge.
+NB! Seda ei kasutanud vaid mõistlikum oli kraapida korraga info kõigi arupärimiste kohta ja seejärel tuvastada riigikogu liikmete lõikes kui palju arupärimisi oli.
+```{r}
+aruparimise_url <- detailinfo_lingid %>% 
+  filter(lingi_nimi == "Kõik arupärimised") %>% 
+  select(link, riigikogu_liige) %>% 
+  mutate(lehti = 7) %>% 
+  splitstackshape::expandRows("lehti") %>% 
+  separate(link, sep = "uuid", into = c("a", "b")) %>% 
+  group_by(riigikogu_liige) %>% 
+  mutate(aruparimise_url = str_c(a, "pg=", row_number(), "&uuid", b)) %>% 
+  ungroup() %>% 
+  select(riigikogu_liige, aruparimise_url)
+
+glimpse(aruparimise_url)
+```
+
+
+Umbes 20-l leheküljel on selle Riigikogu koosseisu arupärimised
+```{r}
+aruparimised_url <- str_c("https://www.riigikogu.ee/tegevus/parlamentaarne-kontroll/aruparimised/?pg=", seq(1:20))
+```
+
+Funktsioon, mis kraabib arupärimiste kohta info
+```{r}
+kraabi_aruparimised <- function(x){
+  
+  Sys.sleep(runif(1, min = 0.5, max = 1.5))
+
+  
+  read_html(x) %>% 
+    html_nodes("td") %>%
+    html_text() %>% 
+    tibble(value = .) %>% 
+    mutate(id = ifelse(as.numeric(value) < 500 & as.numeric(value) > 100, row_number(), NA),
+           id = runner::fill_run(id)) %>% 
+    group_by(id) %>% 
+    mutate(index = row_number()) %>% 
+    ungroup() %>% 
+    spread(index, value) %>% 
+    select(-id)
+}
+
+kraabi_aruparimised_possibly <- possibly(kraabi_aruparimised, NULL)
+
+```
+
+
+Kraabi kõigi arupärimiste kohta info
+```{r}
+tic()
+aruparimised_raw <- future_map_dfr(aruparimised_url, kraabi_aruparimised_possibly)
+toc()
+```
+
+Anna veergudele õiged pealkirjad
+```{r}
+aruparimised_col_names <- c("nr", "kp", "adressaat", "esitaja", "sisu", "vastamise_tahtaeg", "vastamise_kp")
+
+aruparimised <- aruparimised_raw %>% 
+  janitor::clean_names() %>% 
+  select(x1, x2, x3, x4, x5, x6, x7)
+
+names(aruparimised) <- aruparimised_col_names
+
+glimpse(aruparimised)
+```
+
+Töötle arupärimiste andmeid nii, et alles jäävad ainult XIII Riigikogu arupärimised.
+```{r}
+aruparimised_toodeldud <- aruparimised %>% 
+  mutate(kp = as.Date(kp, "%d.%m.%Y")) %>% 
+  filter(kp > as.Date("2015-04-01"))
+
+glimpse(aruparimised_toodeldud)
+```
+
+Funktsioon, mis tuvastab iga Riigikogu liikme kohta, mitu arupärimist ta on esitanud.
+```{r}
+tuvasta_aruparimiste_arv <- function(x){
+
+  aruparimised %>% 
+    filter(str_detect(esitaja, x)) %>% 
+    summarise(aruparimisi = n_distinct(nr)) %>% 
+    mutate(riigikogu_liige = x)
+  
+}
+
+tuvasta_aruparimiste_arv_possibly <- possibly(tuvasta_aruparimiste_arv, NULL)
+```
+
+Tuvasta iga Riigikogu liikme kohta tema arupärimiste arv.
+```{r}
+aruparimiste_arv <- map_df(nimi, tuvasta_aruparimiste_arv_possibly)
+
+aruparimiste_arv %>% 
+  arrange(desc(aruparimisi))
+```
+
+Salvesta arupärimised
+```{r}
+aruparimised_toodeldud %>% write_rds("data/aruparimised.rds")
+```
+
+
+
+## Kirjalikud küsimused
+
+
+Umbes 15-l leheküljel on selle Riigikogu koosseisu kirjalikud küsimused
+```{r}
+kirjalikud_kusimused_url <- str_c("https://www.riigikogu.ee/tegevus/parlamentaarne-kontroll/kirjalikud-kusimused/?pg=", seq(1:15))
+```
+
+Funktsioon, mis kraabib arupärimiste kohta info
+```{r}
+kraabi_kirjalikud_kusimused <- function(x){
+  
+  Sys.sleep(runif(1, min = 0.5, max = 1.5))
+
+  
+  read_html(x) %>% 
+    html_nodes("td") %>%
+    html_text() %>% 
+    tibble(value = .) %>% 
+    mutate(id = ifelse(as.numeric(value) < 500 & as.numeric(value) > 100, row_number(), NA),
+           id = runner::fill_run(id)) %>% 
+    group_by(id) %>% 
+    mutate(index = row_number()) %>% 
+    ungroup() %>% 
+    spread(index, value) %>% 
+    select(-id)
+}
+
+kraabi_kirjalikud_kusimused_possibly <- possibly(kraabi_kirjalikud_kusimused, NULL)
+
+```
+
+
+Kraabi kõigi kirjalike küsimuste kohta info
+```{r}
+tic()
+kirjalikud_kusimused_raw <- future_map_dfr(kirjalikud_kusimused_url, kraabi_kirjalikud_kusimused_possibly)
+toc()
+```
+
+
+Anna veergudele õiged pealkirjad
+```{r}
+kirjalikud_kusimused_col_names <- c("nr", "kp", "adressaat", "esitaja", "sisu", "vastamise_tahtaeg", "vastamise_kp")
+
+kirjalikud_kusimused <- kirjalikud_kusimused_raw %>% 
+  janitor::clean_names() %>% 
+  select(x1, x2, x3, x4, x5, x6, x7)
+
+names(kirjalikud_kusimused) <- kirjalikud_kusimused_col_names
+
+glimpse(kirjalikud_kusimused)
+```
+
+Töötle kirjalike küsimuste andmeid nii, et alles jäävad ainult XIII Riigikogu kirjalikud küsimused.
+```{r}
+kirjalikud_kusimused_toodeldud <- kirjalikud_kusimused %>% 
+  mutate(kp = as.Date(kp, "%d.%m.%Y")) %>% 
+  filter(kp > as.Date("2015-04-01")) %>% 
+  mutate(esitaja = str_replace_all(esitaja, "\\n", ""))
+
+glimpse(kirjalikud_kusimused_toodeldud)
+```
+
+Kirjalike küsimuste arv kõigi Riigikogu liikmete kohta
+```{r}
+kirjalikud_kusimused_kokku <- kirjalikud_kusimused_toodeldud %>% 
+  filter(esitaja %in% nimi) %>% 
+  group_by(esitaja) %>% 
+  summarise(kirjalikke_kusimusi = n_distinct(nr)) %>% 
+  arrange(desc(kirjalikke_kusimusi))
+
+kirjalikud_kusimused_kokku
+```
+
+Salvesta kirjalikud küsimused
+```{r}
+kirjalikud_kusimused_toodeldud %>% write_rds("data/kirjalikud_kusimused.rds")
+```
+
+
+## Artiklid
+
+
+Esmalt tuleb Ubuntu puhul käivitada Seleniumi server läbi shelli kahe käsurea:
+
+$ sudo docker run -d -p 4448:4444 -p 5901:5900 --shm-size=2g -e SE_OPTS="-enablePassThrough false" selenium/standalone-firefox-debug:3.8.1-aluminum
+$ sudo docker ps
+
+Seleniumi serveri sulgemiseks (käsurea lõpus olev nr on Container ID, mille saab käivituse käsust $ sudo docker ps):
+$ sudo docker stop 7e8466a91673
+
+Seejärel saab ühenduse üles ning alustada veebilehe kraapimist.
+
+Create Selenium connection
+```{r}
+remDr <- remoteDr(port = 4448L)
+```
+
+Stop Selenium connection
+```{r}
+# remDr %>%
+#   deleteSession()
+```
+
+
+Funktsioon, mis Seleniumi abil pärib google cache andmed riigikogu liikmete artiklite kohta. See on vajalik, kuna Riigikogust juba lahkunud liikmete andmed ei ole enam riigikogu.ee kättesaadavad.
+```{r}
+kraabi_artiklid <- function(x, y){
+  # otsi google.ee lehelt vastava riigikogu liikme artiklite lehekülge
+  remDr %>% 
+    go("http://www.google.ee") %>% 
+    findElement("name", "q") %>% 
+    elementSendKeys(x, key = "enter")
+  
+  # paus, et leht jõuaks laadida
+  Sys.sleep(runif(n = 1, min = 1, max = 2))
+  
+  # kliki väikesel noolele, et avada cache link  
+  remDr %>%
+    findElement("css", "#am-b0 .mn-dwn-arw") %>% 
+    elementClick()
+  
+  Sys.sleep(runif(n = 1, min = 1, max = 2))
+  
+  # kraabi lehekülje html kood
+  leht <- remDr %>% 
+    getPageSource()
+  
+  # tuvasta cahed link otsitud leheküljele
+  artikli_link <- leht %>% 
+    html_nodes(".fl") %>% 
+    html_attr("href") %>% 
+    tibble() %>% 
+    rename(value = 1) %>% 
+    filter(row_number() == 2) %>% 
+    pull(value)
+  
+  
+  artikli_html <- read_html(artikli_link) 
+  
+  artiklid <- artikli_html %>% 
+    html_nodes(".pad , .link-list a") %>% 
+    html_text()
+  
+  artiklid_url <- artikli_html %>% 
+    html_nodes(".pad , .link-list a") %>% 
+    html_attr("href")
+  
+  # millal cache on tehtud
+  cache_aeg <- artikli_html %>% 
+    html_nodes("div > span:nth-child(2)") %>% 
+    html_text()
+  
+  tibble(artiklid, artiklid_url) %>% 
+    mutate(cache = cache_aeg,
+           riigikogu_liige = y)
+}
+
+kraabi_artiklid_possibly <- possibly(kraabi_artiklid, NULL)
+```
+
+
+Artikli lehekülgede andmed
+```{r}
+artiklid_url <- detailinfo_lingid %>% 
+  filter(lingi_nimi == "Kõik artiklid") %>% 
+  select(link, riigikogu_liige) 
+
+glimpse(artiklid_url)
+```
+
+
+Kraabi kõigi artiklite kohta info
+```{r}
+tic()
+artiklid_raw <- future_map2_dfr(artiklid_url$link, artiklid_url$riigikogu_liige,
+                                kraabi_artiklid_possibly)
+toc()
+
+
+artiklid_raw %>% write_rds("data/artiklid.rds")
+```
+
+Kraabi uuesti need, mis esimene kord ebaõnnestusid
+```{r}
+artiklid_url_2 <- artiklid_url %>% 
+  anti_join(artiklid_raw) %>% 
+  group_by(riigikogu_liige) %>% 
+  mutate(n = rnorm(1)) %>% 
+  ungroup() %>% 
+  arrange(n)
+
+tic()
+artiklid_raw_2 <- future_map2_dfr(artiklid_url_2$link, artiklid_url_2$riigikogu_liige,
+                                kraabi_artiklid_possibly)
+toc()
+
+
+artiklid_raw_2 %>% write_rds("data/artiklid_2.rds")
+```
+
+Kraabi uuesti need, mis eelmine kord ebaõnnestusid
+```{r}
+artiklid_kokku <- artiklid_raw %>% 
+  bind_rows(artiklid_raw_2)
+
+artiklid_url_3 <- artiklid_url %>% 
+  anti_join(artiklid_kokku) %>% 
+  group_by(riigikogu_liige) %>% 
+  mutate(n = rnorm(1)) %>% 
+  ungroup() %>% 
+  arrange(n)
+
+tic()
+artiklid_raw_3 <- future_map2_dfr(artiklid_url_3$link, artiklid_url_3$riigikogu_liige,
+                                kraabi_artiklid_possibly)
+toc()
+
+
+artiklid_raw_3 %>% write_rds("data/artiklid_3.rds")
+```
+
+Pane ühte tabelisse kõik artiklid kokku
+```{r}
+artiklid_koik <- artiklid_raw %>% 
+  bind_rows(artiklid_raw_2) %>% 
+  bind_rows(artiklid_raw_3)
+```
+
+
+```{r}
+glimpse(artiklid_koik)
+```
+
+```{r}
+artiklid_koik %>% 
+  distinct(riigikogu_liige)
+```
+
+Salvesta artiklid
+```{r}
+artiklid_koik %>% write_rds("data/artiklid_koik.rds")
+```
+
+
+## Fraktsioonid
+
+Kraabi fraktsioonide nimed ja liikmed
+```{r}
+fraktsioonid_url <- "https://www.riigikogu.ee/tutvustus-ja-ajalugu/riigikogu-ajalugu/xiii-riigikogu-koosseis/fraktsioonid/"
+
+fraktsioonid_html <- read_html(fraktsioonid_url)
+
+fraktsioonid_raw <- fraktsioonid_html %>% 
+  html_nodes("h3 , .article li") %>% 
+  html_text() %>% 
+  tibble
+```
+
+Puhasta andmed
+```{r}
+fraktsioonid <- fraktsioonid_raw %>% 
+  rename(value = 1) %>% 
+  mutate(value = str_squish(value),
+         fraktsioon = ifelse(str_detect(str_to_lower(value), "fraktsioon"), value, NA),
+         fraktsioon = fill_run(fraktsioon)) %>% 
+  filter(!str_detect(str_to_lower(value), "fraktsioon")) %>% 
+  rename(riigikogu_liige = value)
+  
+```
+
+Salvesta fraktsioonid
+```{r}
+fraktsioonid %>% 
+  write_rds("data/fraktsioonid.rds")
+```
+
