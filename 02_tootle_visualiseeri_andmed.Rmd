@@ -322,9 +322,6 @@ riigikogu_liikmete_aktiivsus %>%
        y = "arupärimised + kirjalikud küsimused + artiklid",
        x = "sõnavõtud")
 
-
-?annotate
-
 ```
 
 
