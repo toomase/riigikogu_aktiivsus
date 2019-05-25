@@ -67,7 +67,7 @@ aruparimised <- map_df(nimi, tuvasta_aruparimiste_arv_possibly)
 
 Kirjalike küsimuste arv kõigi Riigikogu liikmete kohta
 ```{r}
-kirjalikud_kusimused <- kirjalikud_kusimused_raw %>% 
+kirjalikud_kusimused <- kirjalikud_kusimused_raw %>%
   filter(esitaja %in% nimi) %>% 
   group_by(esitaja) %>% 
   summarise(kirjalikke_kusimusi = n_distinct(nr)) %>% 

@@ -1,0 +1,368 @@
+---
+title: "Riigikogu saadikute artiklid"
+---
+
+Analüüsi Riigikogu XIII liikmete poolt kirjutatud artikleid. Aluseks on Riigikogu leheküljel olnud loetelu artiklitest iga saadiku kohta.
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(runner)
+library(tictoc)
+library(ggrepel)
+library(hrbrthemes)
+library(tidytext)
+
+# varasemalt kraabitud toorandmed artiklite kohta
+artiklid_raw <- read_rds("data/artiklid_koik.rds")
+
+# saadikute fraktsioonid
+fraktsioonid_raw <- read_rds("data/fraktsioonid.rds")
+
+# lae stop words
+load("~/Dropbox/DataScience/R/riigikogu_stenogrammid/data/stop_words_est.RData")
+```
+
+```{r}
+glimpse(artiklid_raw)
+```
+
+```{r}
+artiklid_raw %>% 
+  select(artiklid) %>% 
+  sample_n(10) %>% 
+  pull(artiklid)
+```
+
+Eralda artikli nimest kuupäev ja väljaanne
+```{r}
+artiklid <- artiklid_raw %>% 
+  mutate(kp_raw = str_extract_all(str_to_lower(artiklid), ".{4}(jaan|veebr|märts|apr|mai|juuni|juuli|aug|sept|okt|nov|dets).{6}")) %>% 
+  select(kp_raw, artiklid, riigikogu_liige) %>% 
+  unnest(kp_raw) %>% 
+  filter(str_detect(kp_raw, "\\d")) %>% 
+  mutate(paev = str_extract(str_squish(kp_raw), "^\\d{1,2}"),
+         aasta = str_extract(kp_raw, "\\d{4}"),
+         kuu = str_extract(kp_raw, "[:alpha:]+"),
+         kuu = case_when(kuu == "jaan" ~ 1,
+                         kuu == "veebr" ~ 2,
+                         kuu == "märts" ~ 3,
+                         kuu == "apr" ~ 4,
+                         kuu == "mai" ~ 5,
+                         kuu == "juuni" ~ 6,
+                         kuu == "juuli" ~ 7,
+                         kuu == "aug" ~ 8,
+                         kuu == "sept" ~ 9,
+                         kuu == "okt" ~ 10,
+                         kuu == "nov" ~ 11,
+                         kuu == "dets" ~ 12),
+         kp = as.Date(str_c(aasta, kuu, paev, sep = "-")),
+         kp_nadal = floor_date(kp, unit = 'weeks'),
+         valjaanne = str_extract(artiklid, "(?<=\\/\\/ ).*?(?=,)"),
+         blogi = ifelse(str_detect(str_to_lower(artiklid), "blogi"), "blogi", NA),
+         valjaanne = str_to_lower(coalesce(valjaanne, blogi)),
+         valjaanne = str_squish(valjaanne)) %>% 
+  select(riigikogu_liige, kp, kp_nadal, valjaanne, artiklid) %>% 
+  distinct(artiklid, .keep_all = TRUE)
+
+artiklid
+```
+
+Lisa artiklitele riigikogu liikme fraktsioons
+```{r}
+artiklid_fraktsiooniga <- artiklid %>% 
+  left_join(fraktsioonid_raw, by = "riigikogu_liige") %>% 
+  mutate(fraktsioon = case_when(riigikogu_liige == "Krista Aru" ~ "Eesti Vabaerakonna fraktsioon",
+                                is.na(fraktsioon) ~ "Eesti Reformierakonna fraktsioon",
+                                TRUE ~ fraktsioon),
+         fraktsioon = case_when(fraktsioon == "Eesti Keskerakonna fraktsioon" ~ "Keskerakond",
+                                fraktsioon == "Eesti Konservatiivse Rahvaerakonna fraktsioon" ~ "EKRE",
+                                fraktsioon == "Eesti Reformierakonna fraktsioon" ~ "Reformierakond",
+                                fraktsioon == "Eesti Vabaerakonna fraktsioon" ~ "Vabaerakond",
+                                fraktsioon == "Fraktsiooni mittekuuluvad saadikud" ~ "Fraktsioonitud",
+                                fraktsioon == "Isamaa fraktsioon" ~ "Isamaa",
+                                fraktsioon == "Sotsiaaldemokraatliku Erakonna fraktsioon" ~ "Sotsid")) %>% 
+  filter(year(kp) >= 2016, year(kp) <= 2018)
+
+glimpse(artiklid_fraktsiooniga)
+```
+
+
+#### Tutvu andmetega
+
+
+Millal artikleid kirjutatakse nädalate lõikes?
+```{r}
+artiklid_fraktsiooniga %>% 
+  count(kp_nadal) %>% 
+  ggplot(aes(kp_nadal, n)) +
+  geom_line() +
+  theme_ipsum_rc()
+
+```
+
+Mis on kõige populaarsemad väjaanded?
+```{r}
+artiklid_fraktsiooniga %>% 
+  count(valjaanne) %>% 
+  arrange(desc(n))
+```
+
+Grupeeri väljaanded, lisa tunnus venekeelsete artiklite kohta.
+```{r}
+artiklid_fraktsiooniga_toodeldud <- artiklid_fraktsiooniga %>% 
+  mutate(valjaande_grupp = case_when(str_detect(valjaanne, "õhtuleht|ohtuleht") ~ "õhtuleht",
+                                     str_detect(valjaanne, "kesknädal|kesknadal") ~ "kesknädal",
+                                     str_detect(valjaanne, "pealinn|pealinn|stolitsa|столица") ~ "pealinn",
+                                     str_detect(valjaanne, "võrumaa teataja|vorumaatea") ~ "võrumaa teataja",
+                                     str_detect(valjaanne, "äripäev|aripaev") ~ "äripäev",
+                                     str_detect(valjaanne, "lääne elu|le.ee") ~ "lääne elu",
+                                     str_detect(valjaanne, "мк-эстония|mke.ee|mk-эстония") ~ "mk-estonia",
+                                     str_detect(valjaanne, "vabaerakonna nädala") ~ "vabae. nädalakiri",
+                                     str_detect(valjaanne, "põhjarannik|pohjarannik|северное побережье") ~ "põhjarannik",
+                                     str_detect(valjaanne, "postimees") ~ "postimees grupp",
+                                     str_detect(valjaanne, "epl|päevaleht|delfi|eesti ekspress|maaleht|arileht") ~ "ekspress meedia",
+                                     str_detect(valjaanne, "err") ~ "err",
+                                     TRUE ~ valjaanne),
+         venekeelne_artikkel = ifelse(str_detect(artiklid, "[а-яА-ЯЁё]"), 1, 0)) %>% 
+  ungroup()
+
+glimpse(artiklid_fraktsiooniga_toodeldud)
+```
+
+Salvesta töödeldud andmed blogipostituses kasutamiseks.
+```{r}
+write_rds(artiklid_fraktsiooniga_toodeldud, path = "data/artiklid_fraktsiooniga_toodeldud.rds")
+```
+
+
+
+Fraktsioonide lõikes top väljaanded, kus artikleid on avaldatud
+```{r fig.height=10, fig.width=8}
+# iga fraktsiooni top 10 väljaannet
+top_valjaanded <- artiklid_fraktsiooniga_toodeldud %>% 
+  group_by(fraktsioon, valjaande_grupp) %>% 
+  summarise(artikleid = n()) %>% 
+  arrange(fraktsioon, desc(artikleid)) %>% 
+  group_by(fraktsioon) %>% 
+  filter(row_number() <= 10) %>% 
+  ungroup() 
+
+# valjaanded, mis jäävad graafikul halli värvi
+valjaanded_hallid <- top_valjaanded %>% 
+  distinct(valjaande_grupp) %>% 
+  filter(!valjaande_grupp %in% c("postimees grupp", "ekspress meedia", "kesknädal", "err",
+                                 "õhtuleht")) %>% 
+  pull(valjaande_grupp)
+
+# hall värvipalett
+vahem_populaarsed_valjaanded <- setNames(rep("#bdbdbd", 12), valjaanded_hallid)
+
+
+top_valjaanded %>% 
+  ggplot(aes(drlib::reorder_within(valjaande_grupp, artikleid, fraktsioon), artikleid, 
+             group = fraktsioon, fill = valjaande_grupp)) +
+  geom_col() +
+  drlib::scale_x_reordered() +
+  coord_flip() +
+  scale_fill_manual(values = c("postimees grupp" = "#51ACE4",
+                               "ekspress meedia" = "#F8CA1A",
+                               "err" = "#051B30",
+                               "kesknädal" = "#00805C",
+                               "õhtuleht" = "#E4000F",
+                               vahem_populaarsed_valjaanded)) +
+  facet_wrap(~fraktsioon, scales = "free", ncol = 2) +
+  theme_ipsum_rc() +
+  labs(title = "TOP 10 väljaannet iga fraktsiooni kohta",
+       subtitle = "saadikute artiklid ajavahemikust 2016-2018",
+       x = "väljaanne",
+       y = "artiklite arv") +
+  guides(fill = "none")
+
+```
+
+Milline on vene- ja eestikeelsete artiklite osakaal erakondades?
+```{r}
+artiklid_fraktsiooniga_toodeldud %>% 
+  group_by(fraktsioon, venekeelne_artikkel) %>% 
+  summarise(artikleid = n()) %>% 
+  ungroup() %>% 
+  group_by(fraktsioon) %>% 
+  mutate(venekeelsete_osakaal = round(artikleid / sum(artikleid), 3)) %>% 
+  filter(venekeelne_artikkel == 1) %>% 
+  ggplot(aes(fct_reorder(fraktsioon, venekeelsete_osakaal), venekeelsete_osakaal, 
+             fill = fraktsioon)) +
+  geom_col() +
+  coord_flip() +
+  theme_ipsum_rc() +
+  scale_fill_manual(values = c("Reformierakond" = "#FFE200",
+                                 "Vabaerakond" = "#295AA6",
+                                 "Isamaa" = "#00AEEF",
+                                 "Keskerakond" = "#007F5C",
+                                 "EKRE" = "#993404",
+                                 "Sotsid" = "#E10600",
+                                 "Fraktsioonitud" = "#737373")) +
+  scale_y_continuous(labels = scales::percent_format(1),
+                     expand = expand_scale(add = c(0, 0.05))) +
+  geom_text(aes(label = str_c(round(venekeelsete_osakaal, 2) * 100, "%")),
+            hjust = -0.2) +
+  guides(fill = "none") +
+  labs(title = "Venekeelsete artiklite osakaal",
+       subtitle = "saadikute artiklid ajavahemikust 2016-2018",
+       x = "fraktsioon",
+       y = "% artiklitest")
+```
+
+Kes saadikutest on kõige aktiivsemad blogijad?
+```{r}
+artiklid_fraktsiooniga_toodeldud %>% 
+  filter(valjaanne == "blogi") %>% 
+  count(riigikogu_liige, fraktsioon, sort = TRUE) %>% 
+  ggplot(aes(fct_reorder(riigikogu_liige, n), n, 
+             fill = fraktsioon)) +
+  geom_col() +
+  coord_flip() +
+  theme_ipsum_rc() +
+  scale_fill_manual(values = c("Reformierakond" = "#FFE200",
+                                 "Vabaerakond" = "#295AA6",
+                                 "Isamaa" = "#00AEEF",
+                                 "Keskerakond" = "#007F5C",
+                                 "EKRE" = "#993404",
+                                 "Sotsid" = "#E10600",
+                                 "Fraktsioonitud" = "#737373")) +
+  geom_text(aes(label = n), hjust = -0.2) +
+  guides(fill = "none") +
+  labs(title = "Saadikutest blogijad",
+       subtitle = "artiklid ajavahemikust 2016-2018",
+       x = "saadik",
+       y = "blogipostitusi")
+```
+
+
+Millisel nädalapäeval on kõige rohkem artikleid avaldatud?
+```{r}
+artiklid_fraktsiooniga_toodeldud %>% 
+  mutate(paeva_nr = wday(kp, week_start = getOption("lubridate.week.start", 1)),
+         nadalapaev = weekdays(kp, abbreviate = TRUE),
+         nadalapaev = case_when(nadalapaev == "Fri" ~ "reede",
+                                nadalapaev == "Mon" ~ "esmaspäev",
+                                nadalapaev == "Sat" ~ "laupäev",
+                                nadalapaev == "Sun" ~ "pühapäev",
+                                nadalapaev == "Thu" ~ "neljapäev",
+                                nadalapaev == "Tue" ~ "teisipäev",
+                                nadalapaev == "Wed" ~ "kolmappäev"),
+         nadalapaev = fct_reorder(nadalapaev, paeva_nr)) %>% 
+  count(nadalapaev) %>% 
+  ggplot(aes(nadalapaev, n, fill = factor(ifelse(nadalapaev == "neljapäev", 1, 0)))) +
+  geom_col() +
+  theme_ipsum_rc() +
+  scale_y_continuous(expand = expand_scale(mult = c(0, 0.1))) +
+  scale_fill_manual(values = c("#bdbdbd", "#fc8d59")) +
+  geom_text(aes(label = n), vjust = -0.2) +
+  guides(fill = "none") +
+  labs(title = "Neljapäev on kõige populaarsem päev artikli avaldamiseks",
+       subtitle = "artiklid ajavahemikust 2016-2018",
+       x = "nädalapäev",
+       y = "artikleid")
+
+```
+
+Milline on joatus avaldatud artiklite osas selle põhjal, kas seda on tehtud veebis või paberil?
+```{r}
+artiklid_fraktsiooniga_toodeldud %>% 
+  mutate(veeb_paber = ifelse(str_detect(valjaanne, ".ee|blogi|vabaerakonna"), "veeb", "paber")) %>% 
+  filter(!is.na(veeb_paber)) %>% 
+  count(fraktsioon, veeb_paber) %>% 
+  group_by(fraktsioon) %>% 
+  mutate(veebi_osakaal = round(n / sum(n), 3)) %>% 
+  filter(veeb_paber == "veeb") %>% 
+  ggplot(aes(fct_reorder(fraktsioon, veebi_osakaal), veebi_osakaal, 
+             fill = fraktsioon)) +
+  geom_col() +
+  coord_flip() +
+  theme_ipsum_rc() +
+  scale_fill_manual(values = c("Reformierakond" = "#FFE200",
+                                 "Vabaerakond" = "#295AA6",
+                                 "Isamaa" = "#00AEEF",
+                                 "Keskerakond" = "#007F5C",
+                                 "EKRE" = "#993404",
+                                 "Sotsid" = "#E10600",
+                                 "Fraktsioonitud" = "#737373")) +
+  scale_y_continuous(labels = scales::percent_format(1),
+                     expand = expand_scale(add = c(0, 0.1))) +
+  geom_text(aes(label = str_c(round(veebi_osakaal, 2) * 100, "%")),
+            hjust = -0.2) +
+  guides(fill = "none") +
+  labs(title = "Veebiväljaannetes ilmunud artiklite osakaal",
+       subtitle = "saadikute artiklid ajavahemikust 2016-2018",
+       x = "fraktsioon",
+       y = "% artiklitest")
+```
+
+
+## Analüüsi artiklite pealkirju
+
+Eralda artiklite pealkirja ja eemalda seal saadiku enda nimi.
+```{r}
+artiklite_pealkirjad <- artiklid_fraktsiooniga_toodeldud %>% 
+  filter(venekeelne_artikkel == 0) %>% 
+  mutate(eesnimi = word(riigikogu_liige, 1),
+         perenimi = word(riigikogu_liige, 2),
+         artikli_pealkiri = str_extract(artiklid, "^(.*?)(?=\\/|Blogi)"),
+         artikli_pealkiri = str_replace(artikli_pealkiri, "\\: \\[vahendatud tekst\\]", ""),
+         artikli_pealkiri_nimeta = str_replace_all(artikli_pealkiri, str_c(eesnimi, perenimi, sep = "|"), "")) %>% 
+  filter(venekeelne_artikkel == 0) %>% 
+  select(riigikogu_liige, fraktsioon, artikli_pealkiri_nimeta)
+
+artiklite_pealkirjad
+```
+
+Leia igale fraktsioonile 10 kõige iseloomulikumat ja populaarsemat sõna nende artiklitest.
+```{r}
+sonade_sagedus <- artiklite_pealkirjad %>%
+  # igale artiklile indeks külge
+  mutate(indeks_artikkel = row_number()) %>%
+  # leia kõik sõnad artiklitest
+  unnest_tokens(word, artikli_pealkiri_nimeta, drop = FALSE) %>% 
+  anti_join(stop_words_est, by = c("word" = "sona")) %>% 
+  filter(!str_detect(word, "[0-9]"),
+         !word %in% c("jt", "riigikogulane")) %>% 
+  count(fraktsioon, word, sort = TRUE) %>%
+  ungroup() %>%
+  arrange(fraktsioon) %>%
+  bind_tf_idf(word, fraktsioon, n)
+
+
+top10_iseloomulikumat_sona <- sonade_sagedus %>%
+  arrange(fraktsioon, desc(tf_idf)) %>%
+  group_by(fraktsioon) %>%
+  top_n(10) %>%
+  group_by(fraktsioon) %>%
+  mutate(word = factor(word, levels = (unique(word)))) %>%
+  ungroup()
+
+top10_populaarsemat_sona <- sonade_sagedus %>%
+  arrange(fraktsioon, desc(n)) %>%
+  group_by(fraktsioon) %>%
+  top_n(10) %>%
+  group_by(fraktsioon) %>%
+  mutate(word = factor(word, levels = (unique(word)))) %>%
+  ungroup()
+  
+```
+
+
+
+
+
+Milline on artiklite arv fraktsioonide ja kuude lõikes?
+```{r}
+artiklid_fraktsiooniga_toodeldud %>% 
+  mutate(kp_kuu = floor_date(kp, unit = "months")) %>% 
+  count(kp_kuu) %>% 
+  ggplot(aes(kp_kuu, n)) +
+  geom_line() +
+  theme_ipsum_rc()
+```
+
